@@ -2,10 +2,46 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:pointycastle/export.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import '../../core/services/platform_service.dart';
 import '../crypto/vault_crypto.dart';
+
+// ─── Top-level isolate batch-decrypt function ────────────────────────────────
+
+List<Map<String, dynamic>> _batchDecryptNotesIsolate(Map<String, dynamic> input) {
+  final notes = input['notes'] as List<dynamic>;
+  final keyBase64 = input['key'] as String;
+  final key = base64Decode(keyBase64);
+  final results = <Map<String, dynamic>>[];
+
+  for (final note in notes) {
+    final encryptedBody = note['encryptedBody'] as String;
+    String decrypted = '';
+    try {
+      final ciphertext = base64Decode(encryptedBody);
+      if (ciphertext.isNotEmpty) {
+        final iv = ciphertext.sublist(0, 16);
+        final encrypted = ciphertext.sublist(16);
+        final cipher = CBCBlockCipher(AESEngine());
+        final padded = PaddedBlockCipherImpl(PKCS7Padding(), cipher);
+        padded.init(
+          false,
+          PaddedBlockCipherParameters(ParametersWithIV(KeyParameter(key), iv), null),
+        );
+        final decryptedBytes = padded.process(encrypted);
+        decrypted = utf8.decode(decryptedBytes);
+      }
+    } catch (_) {}
+
+    final result = Map<String, dynamic>.from(note);
+    result['encryptedBody'] = decrypted;
+    results.add(result);
+  }
+
+  return results;
+}
 
 class Note {
   final String id;
@@ -43,6 +79,7 @@ class NotesService {
   final PlatformService _platformService;
   final VaultCrypto _crypto;
   static const String _webKey = 'vault_notes';
+  static const String _dbName = 'vault_notes.db';
   Database? _db;
 
   NotesService(this._platformService, this._crypto);
@@ -50,7 +87,7 @@ class NotesService {
   Future<void> _ensureDb() async {
     if (kIsWeb) return;
     _db ??= await openDatabase(
-      p.join(await getDatabasesPath(), 'vault_notes.db'),
+      p.join(await getDatabasesPath(), _dbName),
       version: 1,
       onCreate: (db, version) async {
         await db.execute('''
@@ -67,7 +104,7 @@ class NotesService {
   }
 
   Future<void> addNote(Note note) async {
-    final encryptedBody = _crypto.encryptString(note.encryptedBody);
+    final encryptedBody = await _crypto.encryptString(note.encryptedBody);
 
     if (kIsWeb) {
       final notes = await _getWebNotes();
@@ -93,7 +130,7 @@ class NotesService {
   }
 
   Future<void> updateNote(Note note) async {
-    final encryptedBody = _crypto.encryptString(note.encryptedBody);
+    final encryptedBody = await _crypto.encryptString(note.encryptedBody);
 
     if (kIsWeb) {
       final notes = await _getWebNotes();
@@ -139,34 +176,52 @@ class NotesService {
   Future<List<Note>> getAllNotes() async {
     if (kIsWeb) {
       final notes = await _getWebNotes();
-      return notes.map((n) {
-        String decrypted = '';
+      final decrypted = await Future.wait(notes.map((n) async {
+        String decryptedBody = '';
         try {
-          decrypted = _crypto.decryptString(n['encryptedBody'] as String);
+          decryptedBody = await _crypto.decryptString(n['encryptedBody'] as String);
         } catch (_) {}
         return Note(
           id: n['id'] as String,
           title: n['title'] as String,
-          encryptedBody: decrypted,
+          encryptedBody: decryptedBody,
           createdAt: DateTime.parse(n['createdAt'] as String),
           updatedAt: DateTime.parse(n['updatedAt'] as String),
         );
-      }).toList();
+      }));
+      return decrypted;
     }
 
     await _ensureDb();
     final maps = await _db!.query('notes', orderBy: 'updated_at DESC');
+
+    // Batch-decrypt all notes in a single isolate call to avoid per-note overhead
+    final derivedKey = _crypto.derivedKey;
+    if (derivedKey != null && derivedKey.isNotEmpty) {
+      final input = {
+        'notes': maps,
+        'key': base64Encode(derivedKey),
+      };
+      final decryptedMaps = await compute(_batchDecryptNotesIsolate, input);
+      return decryptedMaps.map((map) {
+        return Note(
+          id: map['id'] as String,
+          title: map['title'] as String,
+          encryptedBody: map['encryptedBody'] as String,
+          createdAt: DateTime.parse(map['createdAt'] as String),
+          updatedAt: DateTime.parse(map['updatedAt'] as String),
+        );
+      }).toList();
+    }
+
+    // Fallback: no key available, return notes with empty bodies
     return maps.map((map) {
-      String decrypted = '';
-      try {
-        decrypted = _crypto.decryptString(map['encryptedBody'] as String);
-      } catch (_) {}
       return Note(
         id: map['id'] as String,
         title: map['title'] as String,
-        encryptedBody: decrypted,
-        createdAt: DateTime.parse(map['created_at'] as String),
-        updatedAt: DateTime.parse(map['updated_at'] as String),
+        encryptedBody: '',
+        createdAt: DateTime.parse(map['createdAt'] as String),
+        updatedAt: DateTime.parse(map['updatedAt'] as String),
       );
     }).toList();
   }
@@ -180,5 +235,7 @@ class NotesService {
 }
 
 final notesServiceProvider = Provider<NotesService>((ref) {
-  return NotesService(ref.read(platformServiceProvider), ref.read(vaultCryptoProvider));
+  final platformService = ref.read(platformServiceProvider);
+  final crypto = ref.read(vaultCryptoProvider);
+  return NotesService(platformService, crypto);
 });

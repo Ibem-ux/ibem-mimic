@@ -78,7 +78,7 @@ class AudioVaultService {
     final id = const Uuid().v4();
     final now = DateTime.now();
 
-    final encrypted = _crypto.encrypt(bytes);
+    final encrypted = await _crypto.encrypt(bytes);
     await _platformService.saveEncryptedFile(id, encrypted);
 
     final meta = AudioMeta(
