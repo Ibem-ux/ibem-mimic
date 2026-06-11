@@ -1,28 +1,31 @@
-// mimic/lib/vault/services/file_vault_service.dart
+// lib/vault/services/video_vault_service.dart
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../core/services/platform_service.dart';
 import '../crypto/vault_crypto.dart';
 
-class PhotoMeta {
+class VideoMeta {
   final String id;
   final String mimeType;
   final int size;
+  final int durationS;
   final DateTime createdAt;
   final String? originalName;
 
-  PhotoMeta({
+  VideoMeta({
     required this.id,
     required this.mimeType,
     required this.size,
+    required this.durationS,
     required this.createdAt,
     this.originalName,
   });
@@ -31,27 +34,29 @@ class PhotoMeta {
         'id': id,
         'mimeType': mimeType,
         'size': size,
+        'durationS': durationS,
         'createdAt': createdAt.toIso8601String(),
         'originalName': originalName,
       };
 
-  factory PhotoMeta.fromMap(Map<String, dynamic> map) => PhotoMeta(
+  factory VideoMeta.fromMap(Map<String, dynamic> map) => VideoMeta(
         id: map['id'] as String,
         mimeType: map['mimeType'] as String,
         size: map['size'] as int,
+        durationS: map['durationS'] as int,
         createdAt: DateTime.parse(map['createdAt'] as String),
         originalName: map['originalName'] as String?,
       );
 }
 
-class FileVaultService {
+class VideoVaultService {
   final PlatformService _platformService;
   final VaultCrypto _crypto;
-  static const String _dbName = 'vault_files.db';
-  static const String _tableName = 'photos';
+  static const String _dbName = 'vault_videos.db';
+  static const String _tableName = 'videos';
   Database? _db;
 
-  FileVaultService(this._platformService, this._crypto);
+  VideoVaultService(this._platformService, this._crypto);
 
   Future<void> _ensureDb() async {
     if (kIsWeb) return;
@@ -64,45 +69,27 @@ class FileVaultService {
             id TEXT PRIMARY KEY,
             mimeType TEXT,
             size INTEGER,
+            durationS INTEGER,
             createdAt TEXT,
             originalName TEXT
           )
         ''');
       },
     );
-    try {
-      final List<Map<String, dynamic>> columns = await _db!.rawQuery("PRAGMA table_info($_tableName)");
-      final hasOriginalName = columns.any((column) => column['name'] == 'originalName');
-      if (!hasOriginalName) {
-        await _db!.execute("ALTER TABLE $_tableName ADD COLUMN originalName TEXT");
-      }
-    } catch (e) {
-      debugPrint('Error updating schema: $e');
-    }
   }
 
-  Future<void> saveFile(String filename, Uint8List bytes) async {
-    final encrypted = await _crypto.encryptSystem(bytes);
-    await _platformService.saveEncryptedFile(filename, encrypted);
-  }
-
-  Future<Uint8List?> readFile(String filename) async {
-    final encrypted = await _platformService.readEncryptedFile(filename);
-    if (encrypted == null) return null;
-    return await _crypto.decryptSystem(encrypted);
-  }
-
-  Future<String> savePhoto(Uint8List bytes, String mimeType, {String? originalName}) async {
+  Future<String> saveVideo(Uint8List bytes, String mimeType, int durationS, {String? originalName}) async {
     final id = const Uuid().v4();
     final now = DateTime.now();
 
     final encrypted = await _crypto.encryptSystem(bytes);
     await _platformService.saveEncryptedFile(id, encrypted);
 
-    final meta = PhotoMeta(
+    final meta = VideoMeta(
       id: id,
       mimeType: mimeType,
       size: bytes.length,
+      durationS: durationS,
       createdAt: now,
       originalName: originalName,
     );
@@ -111,39 +98,39 @@ class FileVaultService {
     return id;
   }
 
-  Future<Uint8List?> getPhoto(String id) async {
+  Future<Uint8List?> getVideo(String id) async {
     final encrypted = await _platformService.readEncryptedFile(id);
     if (encrypted == null) return null;
     return await _crypto.decryptSystem(encrypted);
   }
 
-  Future<void> deletePhoto(String id) async {
+  Future<void> deleteVideo(String id) async {
     await _platformService.deleteFile(id);
     await _deleteMeta(id);
   }
 
-  Future<List<PhotoMeta>> getAllPhotos() async {
+  Future<List<VideoMeta>> getAllVideos() async {
     if (kIsWeb) {
-      final raw = await _platformService.secureRead('vault_photos_meta');
+      final raw = await _platformService.secureRead('vault_videos_meta');
       if (raw == null || raw.isEmpty) return [];
       final List<dynamic> decoded = jsonDecode(raw);
       return decoded
-          .map((e) => PhotoMeta.fromMap(Map<String, dynamic>.from(e)))
+          .map((e) => VideoMeta.fromMap(Map<String, dynamic>.from(e)))
           .toList();
     }
 
     await _ensureDb();
     final maps = await _db!.query(_tableName, orderBy: 'createdAt DESC');
-    return maps.map((map) => PhotoMeta.fromMap(map)).toList();
+    return maps.map((map) => VideoMeta.fromMap(map)).toList();
   }
 
-  Future<void> _saveMeta(PhotoMeta meta) async {
+  Future<void> _saveMeta(VideoMeta meta) async {
     if (kIsWeb) {
-      final existing = await getAllPhotos();
+      final existing = await getAllVideos();
       existing.removeWhere((m) => m.id == meta.id);
       existing.add(meta);
       await _platformService.secureWrite(
-        'vault_photos_meta',
+        'vault_videos_meta',
         jsonEncode(existing.map((m) => m.toMap()).toList()),
       );
       return;
@@ -155,10 +142,10 @@ class FileVaultService {
 
   Future<void> _deleteMeta(String id) async {
     if (kIsWeb) {
-      final existing = await getAllPhotos();
+      final existing = await getAllVideos();
       existing.removeWhere((m) => m.id == id);
       await _platformService.secureWrite(
-        'vault_photos_meta',
+        'vault_videos_meta',
         jsonEncode(existing.map((m) => m.toMap()).toList()),
       );
       return;
@@ -168,12 +155,12 @@ class FileVaultService {
     await _db!.delete(_tableName, where: 'id = ?', whereArgs: [id]);
   }
 
-  Future<List<String>> pickAndEncryptImage(BuildContext context) async {
+  Future<List<String>> pickAndEncryptVideo(BuildContext context) async {
     try {
       final List<AssetEntity>? assets = await AssetPicker.pickAssets(
         context,
         pickerConfig: const AssetPickerConfig(
-          requestType: RequestType.image,
+          requestType: RequestType.video,
         ),
       );
       if (assets == null || assets.isEmpty) return [];
@@ -184,8 +171,9 @@ class FileVaultService {
         if (file == null) continue;
         final bytes = await file.readAsBytes();
         final name = asset.title;
-        final mime = await asset.mimeTypeAsync ?? 'image/jpeg';
-        final id = await savePhoto(bytes, mime, originalName: name);
+        final mime = await asset.mimeTypeAsync ?? 'video/mp4';
+        final durationS = asset.duration;
+        final id = await saveVideo(bytes, mime, durationS, originalName: name);
         savedIds.add(id);
       }
 
@@ -194,7 +182,7 @@ class FileVaultService {
           final deletedIds = await PhotoManager.editor.deleteWithIds(assets.map((a) => a.id).toList());
           if (deletedIds.length < assets.length && context.mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Original photos kept on device.')),
+              const SnackBar(content: Text('Original videos kept on device.')),
             );
           }
         } catch (e) {
@@ -208,53 +196,43 @@ class FileVaultService {
       }
       return savedIds;
     } catch (e) {
-      debugPrint('pickAndEncryptImage failed: $e');
+      debugPrint('pickAndEncryptVideo failed: $e');
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to import photos: $e')),
+          SnackBar(content: Text('Failed to import videos: $e')),
         );
       }
       return [];
     }
   }
 
-  Future<String?> captureAndEncryptImage() async {
+  Future<void> restoreVideoToGallery(String id) async {
+    final bytes = await getVideo(id);
+    if (bytes == null) throw Exception('Video file not found in vault');
+
+    final videos = await getAllVideos();
+    final video = videos.firstWhere((v) => v.id == id);
+    final originalName = video.originalName ?? '$id.mp4';
+
+    final tempDir = await getTemporaryDirectory();
+    final tempFile = File(p.join(tempDir.path, originalName));
     try {
-      final picker = ImagePicker();
-      final XFile? picked = await picker.pickImage(
-        source: ImageSource.camera,
-        maxWidth: 1920,
-        maxHeight: 1920,
-        imageQuality: 85,
+      await tempFile.writeAsBytes(bytes);
+      await PhotoManager.editor.saveVideo(
+        tempFile,
+        title: originalName,
       );
-      if (picked == null) return null;
-      final bytes = await picked.readAsBytes();
-      final id = await savePhoto(bytes, picked.mimeType ?? 'image/jpeg', originalName: p.basename(picked.path));
-      return id;
-    } catch (e) {
-      debugPrint('captureAndEncryptImage failed: $e');
-      return null;
+      await deleteVideo(id);
+    } finally {
+      if (await tempFile.exists()) {
+        await tempFile.delete();
+      }
     }
-  }
-
-  Future<void> restorePhotoToGallery(String id) async {
-    final bytes = await getPhoto(id);
-    if (bytes == null) throw Exception('Photo file not found in vault');
-
-    final photos = await getAllPhotos();
-    final photo = photos.firstWhere((p) => p.id == id);
-    final originalName = photo.originalName ?? '$id.jpg';
-
-    await PhotoManager.editor.saveImage(
-      bytes,
-      filename: originalName,
-    );
-    await deletePhoto(id);
   }
 }
 
-final fileVaultServiceProvider = Provider<FileVaultService>((ref) {
+final videoVaultServiceProvider = Provider<VideoVaultService>((ref) {
   final platformService = ref.read(platformServiceProvider);
   final crypto = ref.read(vaultCryptoProvider);
-  return FileVaultService(platformService, crypto);
+  return VideoVaultService(platformService, crypto);
 });
